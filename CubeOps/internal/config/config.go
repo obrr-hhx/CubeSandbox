@@ -22,6 +22,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/url"
@@ -87,6 +88,71 @@ type Config struct {
 	S3        S3Config        `yaml:"s3"`
 	Warehouse WarehouseConfig `yaml:"warehouse"`
 	Store     StoreConfig     `yaml:"store"`
+	// Autoscale (issue #2193) sizes the compute-node pool through the
+	// Kubernetes Cluster Autoscaler. DISABLED by default.
+	Autoscale AutoscaleConfig `yaml:"autoscale"`
+}
+
+// AutoscaleConfig configures capacity-driven compute-node scaling. CubeOps
+// decides how many nodes to keep and which node to retire; the Kubernetes
+// Cluster Autoscaler adds and removes the machines. CubeOps keeps one
+// placeholder Pod on every node it wants to keep, adds a Pending placeholder to
+// request a node, and removes a placeholder only after the node was isolated
+// and emptied. Zero values take the defaults applied in Load.
+type AutoscaleConfig struct {
+	Enable bool `yaml:"enable"`
+	// Namespace for placeholder Pods; default is the Pod's own namespace.
+	Namespace string `yaml:"namespace"`
+	// NodeSelector selects the compute-node pool, both for the Kubernetes
+	// node list and for placeholder Pods. Required when enabled.
+	NodeSelector map[string]string `yaml:"node_selector"`
+	// Tolerations copied onto placeholder Pods (taints of the pool).
+	Tolerations []AutoscaleToleration `yaml:"tolerations"`
+	// PlaceholderImage is a pause image; PriorityClassName is optional and
+	// must not be below the Cluster Autoscaler expendable cutoff (-10).
+	PlaceholderImage  string `yaml:"placeholder_image"`
+	PriorityClassName string `yaml:"priority_class_name"`
+
+	MinNodes int `yaml:"min_nodes"`
+	MaxNodes int `yaml:"max_nodes"`
+	// TargetUtilization is the scheduler-quota fill (0,1] the pool is sized for.
+	TargetUtilization float64 `yaml:"target_utilization"`
+	// Headroom: the serving nodes must always be able to place this many
+	// more sandboxes of the given shape, using the scheduler's own fit rule
+	// per node (so fragmentation counts). Shape defaults to 4 CPU / 8 GiB.
+	HeadroomSandboxes int   `yaml:"headroom_sandboxes"`
+	SandboxMilliCPU   int64 `yaml:"sandbox_milli_cpu"`
+	SandboxMemoryMB   int64 `yaml:"sandbox_memory_mb"`
+	// RequiredTemplates must be READY on a new node before it counts as
+	// capacity. Empty means: every template READY on all serving nodes.
+	RequiredTemplates []string `yaml:"required_templates"`
+
+	Interval time.Duration `yaml:"interval"`
+	// ScaleInCooldown: demand must stay below the pool for this long before a
+	// node is isolated for retirement.
+	ScaleInCooldown time.Duration `yaml:"scale_in_cooldown"`
+	// DrainTimeout: an isolated node that still has sandboxes after this long
+	// is returned to service; sandboxes are never stopped by the autoscaler.
+	DrainTimeout time.Duration `yaml:"drain_timeout"`
+	// DrainGrace: after isolating a node, wait this long before checking it
+	// is empty, so creates/resumes already past admission can land.
+	DrainGrace time.Duration `yaml:"drain_grace"`
+	// ProvisionTimeout: a requested node that is not serving after this long
+	// is reported (bounded by MaxNodes).
+	ProvisionTimeout time.Duration `yaml:"provision_timeout"`
+	// WarmTimeout: a registered node whose required templates are still not
+	// READY after this long is reported; template redo keeps retrying.
+	WarmTimeout time.Duration `yaml:"warm_timeout"`
+	// DryRun computes and logs decisions without changing Cube or Kubernetes.
+	DryRun bool `yaml:"dry_run"`
+}
+
+// AutoscaleToleration mirrors a Kubernetes toleration.
+type AutoscaleToleration struct {
+	Key      string `yaml:"key" json:"key,omitempty"`
+	Operator string `yaml:"operator" json:"operator,omitempty"`
+	Value    string `yaml:"value" json:"value,omitempty"`
+	Effect   string `yaml:"effect" json:"effect,omitempty"`
 }
 
 // StoreConfig selects the warehouse blob backend. Default is s3.
@@ -209,6 +275,7 @@ func Load() (*Config, error) {
 	if cfg.SandboxDomain == "" {
 		cfg.SandboxDomain = "cube.app"
 	}
+	applyAutoscaleDefaults(&cfg.Autoscale)
 	if cfg.Warehouse.WorkDir == "" {
 		cfg.Warehouse.WorkDir = "/var/tmp/cubeops-warehouse"
 	}
@@ -556,6 +623,27 @@ func overrideFromEnv(cfg *Config) {
 	if v := os.Getenv("CUBE_OPS_WAREHOUSE_CNB_TOKEN"); v != "" {
 		cfg.Warehouse.CNBToken = v
 	}
+	if v := os.Getenv("CUBE_OPS_AUTOSCALE_ENABLE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.Autoscale.Enable = b
+		}
+	}
+	if v := os.Getenv("CUBE_OPS_AUTOSCALE_DRY_RUN"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.Autoscale.DryRun = b
+		}
+	}
+	if v := os.Getenv("CUBE_OPS_AUTOSCALE_MIN_NODES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Autoscale.MinNodes = n
+		}
+	}
+	if v := os.Getenv("CUBE_OPS_AUTOSCALE_MAX_NODES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Autoscale.MaxNodes = n
+		}
+	}
+	overrideAutoscaleFromEnv(&cfg.Autoscale)
 	if v := os.Getenv("CUBE_OPS_WAREHOUSE_GITHUB_REPOS"); v != "" {
 		cfg.Warehouse.GitHubRepos = splitCSV(v)
 	}
@@ -685,4 +773,142 @@ func splitCSV(v string) []string {
 		}
 	}
 	return out
+}
+
+// Autoscale defaults.
+const (
+	DefaultAutoscaleInterval          = 30 * time.Second
+	DefaultAutoscaleScaleInCooldown   = 15 * time.Minute
+	DefaultAutoscaleDrainTimeout      = time.Hour
+	DefaultAutoscaleProvisionTimeout  = 15 * time.Minute
+	DefaultAutoscaleTargetUtilization = 0.7
+	DefaultAutoscaleDrainGrace        = 2 * time.Minute
+	DefaultAutoscaleWarmTimeout       = 30 * time.Minute
+	DefaultAutoscaleHeadroomSandboxes = 2
+	DefaultAutoscaleSandboxMilliCPU   = 4000
+	DefaultAutoscaleSandboxMemoryMB   = 8192
+	DefaultAutoscalePlaceholderImage  = "registry.k8s.io/pause:3.10"
+)
+
+func applyAutoscaleDefaults(a *AutoscaleConfig) {
+	if a.Interval <= 0 {
+		a.Interval = DefaultAutoscaleInterval
+	}
+	if a.ScaleInCooldown <= 0 {
+		a.ScaleInCooldown = DefaultAutoscaleScaleInCooldown
+	}
+	if a.DrainTimeout <= 0 {
+		a.DrainTimeout = DefaultAutoscaleDrainTimeout
+	}
+	if a.ProvisionTimeout <= 0 {
+		a.ProvisionTimeout = DefaultAutoscaleProvisionTimeout
+	}
+	if a.TargetUtilization <= 0 || a.TargetUtilization > 1 {
+		a.TargetUtilization = DefaultAutoscaleTargetUtilization
+	}
+	if a.PlaceholderImage == "" {
+		a.PlaceholderImage = DefaultAutoscalePlaceholderImage
+	}
+	if a.DrainGrace <= 0 {
+		a.DrainGrace = DefaultAutoscaleDrainGrace
+	}
+	if a.WarmTimeout <= 0 {
+		a.WarmTimeout = DefaultAutoscaleWarmTimeout
+	}
+	if a.HeadroomSandboxes < 0 {
+		a.HeadroomSandboxes = 0
+	} else if a.HeadroomSandboxes == 0 {
+		a.HeadroomSandboxes = DefaultAutoscaleHeadroomSandboxes
+	}
+	if a.SandboxMilliCPU <= 0 {
+		a.SandboxMilliCPU = DefaultAutoscaleSandboxMilliCPU
+	}
+	if a.SandboxMemoryMB <= 0 {
+		a.SandboxMemoryMB = DefaultAutoscaleSandboxMemoryMB
+	}
+	if a.MinNodes < 0 {
+		a.MinNodes = 0
+	}
+}
+
+// Validate reports configuration that would make the autoscaler unsafe.
+func (a AutoscaleConfig) Validate() error {
+	if !a.Enable {
+		return nil
+	}
+	if len(a.NodeSelector) == 0 {
+		return fmt.Errorf("autoscale.node_selector is required when autoscale is enabled")
+	}
+	if a.MaxNodes < 1 || a.MaxNodes < a.MinNodes {
+		return fmt.Errorf("autoscale.max_nodes must be >= 1 and >= min_nodes (min=%d max=%d)", a.MinNodes, a.MaxNodes)
+	}
+	return nil
+}
+
+// overrideAutoscaleFromEnv maps CUBE_OPS_AUTOSCALE_* variables (set by the
+// Helm chart) onto the autoscale section. Malformed values are ignored.
+func overrideAutoscaleFromEnv(a *AutoscaleConfig) {
+	if v := os.Getenv("CUBE_OPS_AUTOSCALE_NAMESPACE"); v != "" {
+		a.Namespace = v
+	}
+	if v := os.Getenv("CUBE_OPS_AUTOSCALE_NODE_SELECTOR"); v != "" {
+		m := map[string]string{}
+		for _, kv := range splitCSV(v) {
+			if k, val, ok := strings.Cut(kv, "="); ok && strings.TrimSpace(k) != "" {
+				m[strings.TrimSpace(k)] = strings.TrimSpace(val)
+			}
+		}
+		if len(m) > 0 {
+			a.NodeSelector = m
+		}
+	}
+	if v := os.Getenv("CUBE_OPS_AUTOSCALE_TOLERATIONS"); v != "" {
+		var t []AutoscaleToleration
+		if err := json.Unmarshal([]byte(v), &t); err == nil {
+			a.Tolerations = t
+		}
+	}
+	if v := os.Getenv("CUBE_OPS_AUTOSCALE_PLACEHOLDER_IMAGE"); v != "" {
+		a.PlaceholderImage = v
+	}
+	if v := os.Getenv("CUBE_OPS_AUTOSCALE_PRIORITY_CLASS_NAME"); v != "" {
+		a.PriorityClassName = v
+	}
+	if v := os.Getenv("CUBE_OPS_AUTOSCALE_TARGET_UTILIZATION"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			a.TargetUtilization = f
+		}
+	}
+	if v := os.Getenv("CUBE_OPS_AUTOSCALE_HEADROOM_SANDBOXES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			a.HeadroomSandboxes = n
+		}
+	}
+	if v := os.Getenv("CUBE_OPS_AUTOSCALE_REQUIRED_TEMPLATES"); v != "" {
+		a.RequiredTemplates = splitCSV(v)
+	}
+	for env, dst := range map[string]*int64{
+		"CUBE_OPS_AUTOSCALE_SANDBOX_MILLI_CPU": &a.SandboxMilliCPU,
+		"CUBE_OPS_AUTOSCALE_SANDBOX_MEMORY_MB": &a.SandboxMemoryMB,
+	} {
+		if v := os.Getenv(env); v != "" {
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+				*dst = n
+			}
+		}
+	}
+	for env, dst := range map[string]*time.Duration{
+		"CUBE_OPS_AUTOSCALE_INTERVAL":          &a.Interval,
+		"CUBE_OPS_AUTOSCALE_SCALE_IN_COOLDOWN": &a.ScaleInCooldown,
+		"CUBE_OPS_AUTOSCALE_DRAIN_TIMEOUT":     &a.DrainTimeout,
+		"CUBE_OPS_AUTOSCALE_PROVISION_TIMEOUT": &a.ProvisionTimeout,
+		"CUBE_OPS_AUTOSCALE_DRAIN_GRACE":       &a.DrainGrace,
+		"CUBE_OPS_AUTOSCALE_WARM_TIMEOUT":      &a.WarmTimeout,
+	} {
+		if v := os.Getenv(env); v != "" {
+			if d, err := time.ParseDuration(v); err == nil {
+				*dst = d
+			}
+		}
+	}
 }

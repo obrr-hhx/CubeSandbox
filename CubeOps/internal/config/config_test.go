@@ -336,3 +336,45 @@ store:
 		t.Fatal("CUBE_OPS_STORE_FS_SHARED=true")
 	}
 }
+
+func TestAutoscaleEnvOverridesAndValidate(t *testing.T) {
+	t.Setenv("CUBE_OPS_AUTOSCALE_ENABLE", "true")
+	t.Setenv("CUBE_OPS_AUTOSCALE_MIN_NODES", "1")
+	t.Setenv("CUBE_OPS_AUTOSCALE_MAX_NODES", "3")
+	t.Setenv("CUBE_OPS_AUTOSCALE_NODE_SELECTOR", "nodepool=cubesandbox-pvm, cube.tencent.com/cube-node=true")
+	t.Setenv("CUBE_OPS_AUTOSCALE_TOLERATIONS", `[{"key":"cube.tencent.com/compute","operator":"Equal","value":"true","effect":"NoSchedule"}]`)
+	t.Setenv("CUBE_OPS_AUTOSCALE_SCALE_IN_COOLDOWN", "5m")
+	t.Setenv("CUBE_OPS_AUTOSCALE_HEADROOM_SANDBOXES", "3")
+	t.Setenv("CUBE_OPS_AUTOSCALE_SANDBOX_MILLI_CPU", "2000")
+	t.Setenv("CUBE_OPS_AUTOSCALE_REQUIRED_TEMPLATES", "tpl-a, tpl-b")
+	t.Setenv("CUBE_OPS_AUTOSCALE_DRAIN_GRACE", "90s")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := cfg.Autoscale
+	if !a.Enable || a.MinNodes != 1 || a.MaxNodes != 3 || a.ScaleInCooldown != 5*time.Minute {
+		t.Fatalf("unexpected autoscale config: %+v", a)
+	}
+	if a.NodeSelector["nodepool"] != "cubesandbox-pvm" || a.NodeSelector["cube.tencent.com/cube-node"] != "true" {
+		t.Fatalf("node selector: %+v", a.NodeSelector)
+	}
+	if len(a.Tolerations) != 1 || a.Tolerations[0].Effect != "NoSchedule" {
+		t.Fatalf("tolerations: %+v", a.Tolerations)
+	}
+	if a.HeadroomSandboxes != 3 || a.SandboxMilliCPU != 2000 || a.SandboxMemoryMB != DefaultAutoscaleSandboxMemoryMB ||
+		a.DrainGrace != 90*time.Second || a.WarmTimeout != DefaultAutoscaleWarmTimeout ||
+		len(a.RequiredTemplates) != 2 || a.RequiredTemplates[1] != "tpl-b" {
+		t.Fatalf("shape/grace/templates: %+v", a)
+	}
+	if a.TargetUtilization != DefaultAutoscaleTargetUtilization || a.DrainTimeout != DefaultAutoscaleDrainTimeout {
+		t.Fatalf("defaults not applied: %+v", a)
+	}
+	if err := a.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	a.NodeSelector = nil
+	if a.Validate() == nil {
+		t.Fatal("enabled without node selector must be rejected")
+	}
+}
