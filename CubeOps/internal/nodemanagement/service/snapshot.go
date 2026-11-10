@@ -361,3 +361,24 @@ func mergeIncomingHostFacts(prev, incoming *model.HostFacts) *model.HostFacts {
 	out.KVMModuleScanned = false
 	return &out
 }
+
+// applyRegistrationLabels makes the stored registration the source of truth for
+// labels on a snapshot read back from Redis. Heartbeats rewrite the whole
+// Redis snapshot; without this, a heartbeat that read the snapshot just before
+// a label change (for example isolation) would write the old labels back and
+// keep carrying them forward, so CubeMaster would never see the change even
+// though the database has it. The registration row is written before Redis on
+// every label change, and the heartbeat reads it anyway.
+func applyRegistrationLabels(snap *model.NodeSnapshot, reg *store.NodeRegistration) {
+	if snap == nil || reg == nil {
+		return
+	}
+	labels, err := store.ParseLabelsJSON(reg.LabelsJSON)
+	if err != nil {
+		snap.Labels = map[string]string{}
+		snap.LabelsJSONCorrupt = true
+		return
+	}
+	snap.Labels = labels
+	snap.LabelsJSONCorrupt = false
+}
