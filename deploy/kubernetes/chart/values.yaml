@@ -1390,6 +1390,24 @@ hostPaths:
 # COS volume plugin credentials (volume-cos.conf). Plugin binaries ship in
 # cube-master / cubelet images; this Secret mounts the conf next to them.
 # Leave enabled=false to install a cluster without COS volume support.
+# Third-party volume plugins registered on both sides of Cube's volume plugin
+# framework: appended to CubeMaster conf.yaml volume_plugins (after s3 and cos,
+# so never the default driver) and to Cubelet config.toml. Install the plugin
+# itself (its node socket or binary on every Cube node, and its controller
+# endpoint reachable from CubeMaster) outside this chart, outside the
+# cubetoolbox tree so upgrades do not reset it. Example:
+#
+#   volumePlugins:
+#     extra:
+#       - name: alfs
+#         type: rpc
+#         master:
+#           socketPath: cube-volume-alfs-controller.cube-system.svc:9200
+#         node:
+#           socketPath: /data/cube-shared/run/cube-volume-alfs/node.sock
+volumePlugins:
+  extra: []
+
 volumeCos:
   enabled: false
   # Use an existing Secret that contains key "volume-cos.conf". When set,
