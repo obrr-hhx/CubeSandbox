@@ -1514,7 +1514,7 @@ hostPaths:
 #       - name: alfs
 #         type: rpc
 #         master:
-#           socketPath: cube-volume-alfs-controller.cube-system.svc:9200
+#           socketPath: cube-volume-alfs-controller.cube-volume-alfs.svc:9200
 #         node:
 #           socketPath: /data/cube-shared/run/cube-volume-alfs/node.sock
 volumePlugins:

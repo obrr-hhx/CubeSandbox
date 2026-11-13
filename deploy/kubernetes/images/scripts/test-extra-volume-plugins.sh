@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Unit checks for patch_extra_volume_plugins in cube-node-entrypoint.sh (no
+# Unit checks for patch_extra_volume_plugins in component-entrypoint.sh (the
+# cubelet container's entrypoint) (no
 # container required): blocks are appended, rewritten idempotently across
 # restarts, removed when the list shrinks, and bad entries are rejected.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENTRY="${SCRIPT_DIR}/cube-node-entrypoint.sh"
+ENTRY="${SCRIPT_DIR}/component-entrypoint.sh"
 TMP="$(mktemp -d)"
 trap 'rm -rf "${TMP}"' EXIT
 
-# The entrypoint runs at top level, so load only the function under test.
+# Load only the function under test; the entrypoint itself needs a node.
 # shellcheck disable=SC1090
 source <(awk '/^patch_extra_volume_plugins\(\) \{/,/^}/' "${ENTRY}")
 
