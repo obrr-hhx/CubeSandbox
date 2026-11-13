@@ -67,7 +67,7 @@ spec:
               value: run
             {{- with .Values.volumePlugins.extra }}
             # name|type|path entries appended to Cubelet config.toml by
-            # cube-node-entrypoint.sh (see volumePlugins.extra).
+            # component-entrypoint.sh run_cubelet (see volumePlugins.extra).
             - name: CUBE_EXTRA_VOLUME_PLUGINS
               value: {{ include "cube.extraVolumePluginsEnv" . | quote }}
             {{- end }}

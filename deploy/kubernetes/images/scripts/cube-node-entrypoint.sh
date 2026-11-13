@@ -63,59 +63,6 @@ detect_primary_interface() {
     }'
 }
 
-# patch_extra_volume_plugins <config.toml> <entries>
-# Appends third-party volume plugins (chart values volumePlugins.extra,
-# rendered as "name|type|path;...") to Cubelet's config.toml. config.toml
-# lives on the host and survives restarts, so every block carries a marker
-# line and blocks from a previous start are removed before the current list
-# is written: the file always reflects the current values, removed plugins
-# included.
-patch_extra_volume_plugins() {
-  local config="$1" raw="$2"
-  local marker_prefix="# extra-volume-plugin:"
-  local tmp_file
-  tmp_file="$(mktemp)"
-  # Drop previously written blocks: a marker line plus the 4 lines after it.
-  awk -v prefix="${marker_prefix}" '
-    index($0, prefix) == 1 { skip = 5 }
-    skip > 0 { skip--; next }
-    { print }
-  ' "${config}" >"${tmp_file}"
-  cat "${tmp_file}" >"${config}"
-  rm -f "${tmp_file}"
-
-  [[ -n "${raw//[[:space:];]/}" ]] || return 0
-  local entry name type path key
-  local -a entries
-  IFS=';' read -r -a entries <<<"${raw}"
-  for entry in "${entries[@]}"; do
-    [[ -n "${entry//[[:space:]]/}" ]] || continue
-    IFS='|' read -r name type path <<<"${entry}"
-    if [[ ! "${name}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-      printf '[cube-node-entrypoint] FATAL: invalid extra volume plugin name %q\n' "${name}" >&2
-      return 1
-    fi
-    case "${type}" in
-      rpc) key="socket_path" ;;
-      binary) key="binary_path" ;;
-      *)
-        printf '[cube-node-entrypoint] FATAL: extra volume plugin %s: type must be rpc or binary, got %q\n' "${name}" "${type}" >&2
-        return 1
-        ;;
-    esac
-    if [[ -z "${path}" || "${path}" == *'"'* ]]; then
-      printf '[cube-node-entrypoint] FATAL: extra volume plugin %s: invalid path %q\n' "${name}" "${path}" >&2
-      return 1
-    fi
-    if grep -Eq "^[[:space:]]*name[[:space:]]*=[[:space:]]*\"${name}\"" "${config}"; then
-      printf '[cube-node-entrypoint] FATAL: extra volume plugin %s collides with a packaged plugin\n' "${name}" >&2
-      return 1
-    fi
-    printf '%s %s\n[[plugins."io.cubelet.internal.v1.storage".volume_plugins]]\n  name = "%s"\n  type = "%s"\n  %s = "%s"\n' \
-      "${marker_prefix}" "${name}" "${name}" "${type}" "${key}" "${path}" >>"${config}"
-  done
-}
-
 validate_runtime_commands() {
   for cmd in mkfs.ext4 mount umount losetup cube-runtime containerd-shim-cube-rs cubecli cubevsmapdump; do
     require_cmd "${cmd}"
@@ -311,8 +258,6 @@ if [[ -n "${CUBE_WORKFLOW_CONCURRENT:-}" ]]; then
   [[ "${CUBE_WORKFLOW_CONCURRENT}" =~ ^[0-9]+$ ]] || fail "CUBE_WORKFLOW_CONCURRENT must be a non-negative integer"
   sed -i "s/concurrent = [0-9]\+/concurrent = ${CUBE_WORKFLOW_CONCURRENT}/g" "${CUBELET_CONFIG}"
 fi
-
-patch_extra_volume_plugins "${CUBELET_CONFIG}" "${CUBE_EXTRA_VOLUME_PLUGINS:-}"
 
 mkdir -p \
   "${TOOLBOX_ROOT}/cube-vs/network" \
